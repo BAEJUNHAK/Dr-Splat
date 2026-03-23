@@ -293,9 +293,11 @@ if __name__ == "__main__":
 
 
     try:
-        args.modelpath = args.model_path + f"_{str(args.feature_level)}_{args.name_extra}_topk{args.topk}_weight_{index.coarsecode_size()+index.code_size}"
+        args.model_path = args.model_path + f"_{str(args.feature_level)}_{args.name_extra}_topk{args.topk}_weight_{index.coarsecode_size()+index.code_size}"
     except :
         args.model_path = args.model_path + f"_{str(args.feature_level)}_{args.name_extra}_topk{args.topk}_weight_{index.code_size}"
+
+    os.makedirs(args.model_path, exist_ok=True)
 
     if args.use_pq:
         if args.pq_index is None:
