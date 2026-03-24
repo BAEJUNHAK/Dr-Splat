@@ -166,6 +166,10 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
+    # cfg_args 저장 (render_pca, render_activation에서 필요)
+    with open(os.path.join(dataset.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
