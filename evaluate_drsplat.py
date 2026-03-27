@@ -18,9 +18,8 @@ import numpy as np
 import torch
 import cv2
 import faiss
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 from tqdm import tqdm
-from PIL import Image
 
 from scene import Scene
 from scene.gaussian_model import GaussianModel
@@ -67,24 +66,30 @@ def compute_metrics(pred_mask, gt_mask):
     }
 
 
-def render_activation_mask(gaussians, view, activation_features, threshold, pipeline, background, args):
-    """activation을 기반으로 바이너리 마스크를 2D 렌더링"""
-    import copy
-    mask_gaussians = copy.deepcopy(gaussians)
-
+def render_activation_mask(gaussians, view, activation_features, threshold, pipeline, background, args,
+                           orig_dc=None, orig_rest=None):
+    """activation을 기반으로 바이너리 마스크를 2D 렌더링 (deepcopy 대신 색상만 교체)"""
     activation_mask = activation_features.squeeze() > threshold
+
+    # 기존 색상 백업 (최초 1회만)
+    saved_dc = gaussians._features_dc.data.clone()
+    saved_rest = gaussians._features_rest.data.clone()
 
     # 활성화된 Gaussian = 흰색, 나머지 = 검정
     white_sh = (torch.tensor([[[1.0, 1.0, 1.0]]], device="cuda") - 0.5) / 0.28209479177387814
     black_sh = (torch.tensor([[[0.0, 0.0, 0.0]]], device="cuda") - 0.5) / 0.28209479177387814
 
-    mask_gaussians._features_dc[activation_mask] = white_sh.expand(activation_mask.sum(), 1, 3)
-    mask_gaussians._features_rest[activation_mask] = 0
-    mask_gaussians._features_dc[~activation_mask] = black_sh.expand((~activation_mask).sum(), 1, 3)
-    mask_gaussians._features_rest[~activation_mask] = 0
+    gaussians._features_dc.data[activation_mask] = white_sh.expand(activation_mask.sum(), 1, 3)
+    gaussians._features_rest.data[activation_mask] = 0
+    gaussians._features_dc.data[~activation_mask] = black_sh.expand((~activation_mask).sum(), 1, 3)
+    gaussians._features_rest.data[~activation_mask] = 0
 
-    output = render(view, mask_gaussians, pipeline, background, args)
+    output = render(view, gaussians, pipeline, background, args)
     rendered = output["render"]  # [3, H, W]
+
+    # 색상 복원
+    gaussians._features_dc.data.copy_(saved_dc)
+    gaussians._features_rest.data.copy_(saved_rest)
 
     # grayscale로 변환 후 threshold
     gray = rendered.mean(dim=0).cpu().numpy()  # [H, W]
@@ -102,6 +107,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="eval_results")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--include_feature", action="store_true")
 
     args = get_combined_args(parser)
 
@@ -177,9 +183,7 @@ def main():
 
         # 원본 이미지 렌더링 (오버레이용)
         with torch.no_grad():
-            import copy
-            orig_gaussians = copy.deepcopy(gaussians)
-            orig_output = render(cam, orig_gaussians, pipe, background, args)
+            orig_output = render(cam, gaussians, pipe, background, args)
             orig_img = orig_output["render"].cpu().permute(1, 2, 0).numpy()
             orig_img = np.clip(orig_img * 255, 0, 255).astype(np.uint8)
             render_h, render_w = orig_img.shape[:2]
@@ -225,11 +229,12 @@ def main():
             cv2.imwrite(gt_path, gt_mask * 255)
 
             # 오버레이 저장
-            overlay = orig_img.copy()
-            overlay[gt_mask == 1] = overlay[gt_mask == 1] * 0.6 + np.array([0, 255, 0]) * 0.4
-            overlay[pred_mask == 1] = overlay[pred_mask == 1] * 0.7 + np.array([255, 0, 0]) * 0.3
+            overlay = orig_img.copy().astype(np.float32)
+            overlay[gt_mask == 1] = overlay[gt_mask == 1] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4
+            overlay[pred_mask == 1] = overlay[pred_mask == 1] * 0.7 + np.array([255, 0, 0], dtype=np.float32) * 0.3
+            overlay = np.clip(overlay, 0, 255).astype(np.uint8)
             overlay_path = os.path.join(output_dir, "overlay", f"{frame_name}_{safe_cat}_iou{metrics['iou']:.1f}.png")
-            cv2.imwrite(overlay_path, cv2.cvtColor(overlay.astype(np.uint8), cv2.COLOR_RGB2BGR))
+            cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
             metrics["pred_path"] = pred_path
             metrics["gt_path"] = gt_path
