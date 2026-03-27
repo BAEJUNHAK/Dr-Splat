@@ -196,54 +196,62 @@ def main():
         for obj in data["objects"]:
             category = obj["category"]
             segmentation = obj["segmentation"]
-            sentences = obj.get("note", category)
+            sentence = obj.get("note", "")
 
             # GT 마스크 생성
             gt_mask_full = polygon_to_mask(segmentation, img_h, img_w)
-            # 렌더링 해상도에 맞게 리사이즈
             gt_mask = cv2.resize(gt_mask_full, (render_w, render_h), interpolation=cv2.INTER_NEAREST)
 
-            # CLIP 텍스트 인코딩 + activation 계산
-            clip_model.set_positives([category])
-            activation_features = torch.zeros((features.shape[0], 1), dtype=torch.float32).cuda()
-            with torch.no_grad():
-                _activation = clip_model.get_activation(leaf_lang_feat, 0)
-            activation_features[~zero_mask] = _activation
+            # 두 가지 쿼리로 평가: (1) 카테고리 단어, (2) 설명 문장
+            queries = [("category", category)]
+            if sentence and sentence != category:
+                queries.append(("sentence", sentence))
 
-            # 2D 마스크 렌더링
-            with torch.no_grad():
-                pred_mask, rendered = render_activation_mask(
-                    gaussians, cam, activation_features, args.threshold,
-                    pipe, background, args
-                )
+            for query_type, query_text in queries:
+                # CLIP 텍스트 인코딩 + activation 계산
+                clip_model.set_positives([query_text])
+                activation_features = torch.zeros((features.shape[0], 1), dtype=torch.float32).cuda()
+                with torch.no_grad():
+                    _activation = clip_model.get_activation(leaf_lang_feat, 0)
+                activation_features[~zero_mask] = _activation
 
-            # 메트릭 계산
-            metrics = compute_metrics(pred_mask, gt_mask)
-            metrics["frame"] = frame_name
-            metrics["category"] = category
-            metrics["sentence"] = sentences
-            metrics["scene"] = scene_name
+                # 2D 마스크 렌더링
+                with torch.no_grad():
+                    pred_mask, rendered = render_activation_mask(
+                        gaussians, cam, activation_features, args.threshold,
+                        pipe, background, args
+                    )
 
-            all_results.append(metrics)
+                # 메트릭 계산
+                metrics = compute_metrics(pred_mask, gt_mask)
+                metrics["frame"] = frame_name
+                metrics["category"] = category
+                metrics["query_type"] = query_type
+                metrics["query_text"] = query_text
+                metrics["sentence"] = sentence
+                metrics["scene"] = scene_name
 
-            # 마스크 저장
-            safe_cat = category.replace(" ", "_").replace("/", "_")
-            pred_path = os.path.join(output_dir, "pred_masks", f"{frame_name}_{safe_cat}.png")
-            gt_path = os.path.join(output_dir, "gt_masks", f"{frame_name}_{safe_cat}.png")
-            cv2.imwrite(pred_path, pred_mask * 255)
-            cv2.imwrite(gt_path, gt_mask * 255)
+                all_results.append(metrics)
 
-            # 오버레이 저장
-            overlay = orig_img.copy().astype(np.float32)
-            overlay[gt_mask == 1] = overlay[gt_mask == 1] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4
-            overlay[pred_mask == 1] = overlay[pred_mask == 1] * 0.7 + np.array([255, 0, 0], dtype=np.float32) * 0.3
-            overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-            overlay_path = os.path.join(output_dir, "overlay", f"{frame_name}_{safe_cat}_iou{metrics['iou']:.1f}.png")
-            cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                # 마스크 저장
+                safe_cat = category.replace(" ", "_").replace("/", "_")
+                safe_qt = query_type[0]  # 'c' or 's'
+                pred_path = os.path.join(output_dir, "pred_masks", f"{frame_name}_{safe_cat}_{safe_qt}.png")
+                gt_path = os.path.join(output_dir, "gt_masks", f"{frame_name}_{safe_cat}.png")
+                cv2.imwrite(pred_path, pred_mask * 255)
+                cv2.imwrite(gt_path, gt_mask * 255)
 
-            metrics["pred_path"] = pred_path
-            metrics["gt_path"] = gt_path
-            metrics["overlay_path"] = overlay_path
+                # 오버레이 저장
+                overlay = orig_img.copy().astype(np.float32)
+                overlay[gt_mask == 1] = overlay[gt_mask == 1] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4
+                overlay[pred_mask == 1] = overlay[pred_mask == 1] * 0.7 + np.array([255, 0, 0], dtype=np.float32) * 0.3
+                overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+                overlay_path = os.path.join(output_dir, "overlay", f"{frame_name}_{safe_cat}_{safe_qt}_iou{metrics['iou']:.1f}.png")
+                cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+                metrics["pred_path"] = pred_path
+                metrics["gt_path"] = gt_path
+                metrics["overlay_path"] = overlay_path
 
     # 결과 저장
     results_path = os.path.join(output_dir, "results.json")
@@ -269,17 +277,25 @@ def main():
         print(f"  Detection Rate:   {np.mean(detected)*100:.1f}%")
         print(f"{'='*60}")
 
-        # 카테고리별 결과
+        # query_type별 결과
         from collections import defaultdict
-        cat_results = defaultdict(list)
-        for r in all_results:
-            cat_results[r["category"]].append(r["iou"])
+        for qt in ["category", "sentence"]:
+            qt_results = [r for r in all_results if r.get("query_type") == qt]
+            if not qt_results:
+                continue
+            qt_ious = [r["iou"] for r in qt_results]
+            print(f"\n--- Query Type: {qt} ---")
+            print(f"  mIoU: {np.mean(qt_ious):.2f}%  (n={len(qt_results)})")
 
-        print(f"\n{'Category':<25s} {'mIoU':>8s} {'Count':>6s}")
-        print("-" * 45)
-        for cat in sorted(cat_results.keys()):
-            ious_cat = cat_results[cat]
-            print(f"  {cat:<23s} {np.mean(ious_cat):>7.2f}% {len(ious_cat):>5d}")
+            cat_results = defaultdict(list)
+            for r in qt_results:
+                cat_results[r["category"]].append(r["iou"])
+
+            print(f"\n  {'Category':<25s} {'mIoU':>8s} {'Count':>6s}")
+            print("  " + "-" * 43)
+            for cat in sorted(cat_results.keys()):
+                ious_cat = cat_results[cat]
+                print(f"    {cat:<23s} {np.mean(ious_cat):>7.2f}% {len(ious_cat):>5d}")
 
     print(f"\nResults saved to: {results_path}")
 
