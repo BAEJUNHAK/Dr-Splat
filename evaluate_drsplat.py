@@ -1,18 +1,23 @@
 """
-Dr. Splat 정량 평가 스크립트
-GT 마스크(JSON 폴리곤)와 Dr. Splat activation 결과를 비교하여 mIoU 등을 계산
+Dr. Splat 정량 평가 스크립트 (Ref-lerf 포맷 지원)
+GT 마스크(PNG)와 Dr. Splat activation 결과를 비교하여 mIoU 등을 계산
+
+Ref-lerf 데이터 구조:
+    <ref_lerf_dir>/<scene>/json/test_json/frame_XXXXX.json
+    <ref_lerf_dir>/<scene>/gt_mask/*.png
 
 Usage:
     python evaluate_drsplat.py \
         -s <scene_path> \
         -m <model_path> \
         --pq_index <pq_index_path> \
-        --label_dir <label_dir> \
+        --ref_lerf_dir <ref_lerf_dir> \
         --output_dir <output_dir> \
         --threshold 0.5
 """
 
 import os
+import re
 import json
 import numpy as np
 import torch
@@ -26,14 +31,6 @@ from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, get_combined_args
 from evaluation.openclip_encoder import OpenCLIPNetwork
-
-
-def polygon_to_mask(polygon, height, width):
-    """JSON 폴리곤 좌표를 바이너리 마스크로 변환"""
-    pts = np.array(polygon, dtype=np.int32).reshape(-1, 1, 2)
-    mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(mask, [pts], 1)
-    return mask
 
 
 def compute_metrics(pred_mask, gt_mask):
@@ -66,16 +63,13 @@ def compute_metrics(pred_mask, gt_mask):
     }
 
 
-def render_activation_mask(gaussians, view, activation_features, threshold, pipeline, background, args,
-                           orig_dc=None, orig_rest=None):
-    """activation을 기반으로 바이너리 마스크를 2D 렌더링 (deepcopy 대신 색상만 교체)"""
+def render_activation_mask(gaussians, view, activation_features, threshold, pipeline, background, args):
+    """activation을 기반으로 바이너리 마스크를 2D 렌더링"""
     activation_mask = activation_features.squeeze() > threshold
 
-    # 기존 색상 백업 (최초 1회만)
     saved_dc = gaussians._features_dc.data.clone()
     saved_rest = gaussians._features_rest.data.clone()
 
-    # 활성화된 Gaussian = 흰색, 나머지 = 검정
     white_sh = (torch.tensor([[[1.0, 1.0, 1.0]]], device="cuda") - 0.5) / 0.28209479177387814
     black_sh = (torch.tensor([[[0.0, 0.0, 0.0]]], device="cuda") - 0.5) / 0.28209479177387814
 
@@ -85,25 +79,24 @@ def render_activation_mask(gaussians, view, activation_features, threshold, pipe
     gaussians._features_rest.data[~activation_mask] = 0
 
     output = render(view, gaussians, pipeline, background, args)
-    rendered = output["render"]  # [3, H, W]
+    rendered = output["render"]
 
-    # 색상 복원
     gaussians._features_dc.data.copy_(saved_dc)
     gaussians._features_rest.data.copy_(saved_rest)
 
-    # grayscale로 변환 후 threshold
-    gray = rendered.mean(dim=0).cpu().numpy()  # [H, W]
+    gray = rendered.mean(dim=0).cpu().numpy()
     binary_mask = (gray > 0.5).astype(np.uint8)
 
     return binary_mask, rendered
 
 
 def main():
-    parser = ArgumentParser(description="Dr. Splat Evaluation")
+    parser = ArgumentParser(description="Dr. Splat Evaluation (Ref-lerf format)")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--pq_index", type=str, required=True)
-    parser.add_argument("--label_dir", type=str, required=True)
+    parser.add_argument("--ref_lerf_dir", type=str, required=True,
+                        help="Path to Ref-lerf root (contains <scene>/json/test_json/ and <scene>/gt_mask/)")
     parser.add_argument("--output_dir", type=str, default="eval_results")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--quiet", action="store_true")
@@ -129,28 +122,35 @@ def main():
 
     pipe = pipeline.extract(args)
 
-    # PQ 디코딩: 3D Gaussian의 language feature
+    # PQ 디코딩
     features = gaussians._language_feature.clone()
     zero_mask = torch.all(features == -1, dim=-1)
     leaf_lang_feat = torch.from_numpy(index.sa_decode(features[~zero_mask].cpu().numpy())).to(device)
 
-    # GT label 로드
-    label_dir = args.label_dir
+    # Ref-lerf 경로 구성
     scene_name = os.path.basename(dataset.source_path)
-    scene_label_dir = os.path.join(label_dir, scene_name)
+    ref_lerf_scene = os.path.join(args.ref_lerf_dir, scene_name)
+    test_json_dir = os.path.join(ref_lerf_scene, "json", "test_json")
+    gt_mask_dir = os.path.join(ref_lerf_scene, "gt_mask")
 
-    if not os.path.exists(scene_label_dir):
-        print(f"[ERROR] Label dir not found: {scene_label_dir}")
+    if not os.path.isdir(test_json_dir):
+        print(f"[ERROR] test_json dir not found: {test_json_dir}")
+        return
+    if not os.path.isdir(gt_mask_dir):
+        print(f"[ERROR] gt_mask dir not found: {gt_mask_dir}")
         return
 
-    # 테스트 프레임 매칭
-    json_files = sorted([f for f in os.listdir(scene_label_dir) if f.endswith('.json')])
+    json_files = sorted([f for f in os.listdir(test_json_dir) if f.endswith('.json')])
+    print(f"  Scene: {scene_name}")
+    print(f"  Test JSON files: {len(json_files)}")
+    print(f"  GT mask dir: {gt_mask_dir}")
 
-    # 카메라 뷰 가져오기 (train + test)
+    # 카메라 뷰 (train + test 모두에서 매칭)
     all_cameras = scene.getTrainCameras() + scene.getTestCameras()
     cam_dict = {}
     for cam in all_cameras:
         cam_dict[cam.image_name] = cam
+    print(f"  Total cameras: {len(cam_dict)} (train: {len(scene.getTrainCameras())}, test: {len(scene.getTestCameras())})")
 
     output_dir = os.path.join(args.output_dir, scene_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -161,19 +161,15 @@ def main():
     all_results = []
 
     for json_file in tqdm(json_files, desc="Evaluating"):
-        json_path = os.path.join(scene_label_dir, json_file)
+        json_path = os.path.join(test_json_dir, json_file)
         with open(json_path) as f:
             data = json.load(f)
 
         frame_name = json_file.replace('.json', '')
-        img_w = data["info"]["width"]
-        img_h = data["info"]["height"]
 
-        # 카메라 뷰 찾기 (정확 매칭 → 숫자 매칭 → 서브스트링)
+        # 카메라 뷰 찾기
         cam = cam_dict.get(frame_name)
         if cam is None:
-            # frame_00060에서 숫자 추출하여 매칭
-            import re
             frame_nums = re.findall(r'\d+', frame_name)
             frame_num = frame_nums[-1] if frame_nums else None
             if frame_num:
@@ -185,6 +181,7 @@ def main():
         if cam is None:
             print(f"[WARN] Camera not found for {frame_name}, skipping")
             continue
+        print(f"  {frame_name} -> {cam.image_name}")
 
         # 원본 이미지 렌더링 (오버레이용)
         with torch.no_grad():
@@ -193,19 +190,52 @@ def main():
             orig_img = np.clip(orig_img * 255, 0, 255).astype(np.uint8)
             render_h, render_w = orig_img.shape[:2]
 
-        for obj in data["objects"]:
-            category = obj["category"]
-            segmentation = obj["segmentation"]
-            sentence = obj.get("note", "")
+        # Ref-lerf JSON: "object" (not "objects")
+        objects = data.get("object", data.get("objects", []))
 
-            # GT 마스크 생성
-            gt_mask_full = polygon_to_mask(segmentation, img_h, img_w)
+        for obj in objects:
+            category = obj.get("category", "unknown")
+            segmentation = obj.get("segmentation", "")
+            sentences = obj.get("sentence", [])
+            # 이전 포맷 호환: "note" 필드
+            if not sentences and "note" in obj:
+                sentences = [obj["note"]]
+
+            # GT 마스크 로드 (PNG 파일 경로 or 폴리곤 좌표)
+            if isinstance(segmentation, str) and segmentation:
+                # Ref-lerf 포맷: segmentation은 gt_mask/ 내 PNG 파일 경로
+                mask_path = os.path.join(ref_lerf_scene, segmentation)
+                if not os.path.exists(mask_path):
+                    # gt_mask/ 접두사 없이 시도
+                    mask_path = os.path.join(gt_mask_dir, os.path.basename(segmentation))
+                if not os.path.exists(mask_path):
+                    print(f"    [WARN] GT mask not found: {segmentation}, skipping")
+                    continue
+                gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if gt_mask_full is None:
+                    print(f"    [WARN] Failed to read mask: {mask_path}, skipping")
+                    continue
+                gt_mask_full = (gt_mask_full > 127).astype(np.uint8)
+            elif isinstance(segmentation, list) and len(segmentation) > 0:
+                # 이전 포맷: 폴리곤 좌표
+                img_w = data.get("info", {}).get("width", render_w)
+                img_h = data.get("info", {}).get("height", render_h)
+                pts = np.array(segmentation, dtype=np.int32).reshape(-1, 1, 2)
+                gt_mask_full = np.zeros((img_h, img_w), dtype=np.uint8)
+                cv2.fillPoly(gt_mask_full, [pts], 1)
+            else:
+                print(f"    [WARN] Invalid segmentation for {category}, skipping")
+                continue
+
+            # 렌더링 해상도에 맞게 리사이즈
             gt_mask = cv2.resize(gt_mask_full, (render_w, render_h), interpolation=cv2.INTER_NEAREST)
 
-            # 두 가지 쿼리로 평가: (1) 카테고리 단어, (2) 설명 문장
+            # 쿼리: (1) 카테고리 단어, (2) 설명 문장 1개 (첫 번째)
             queries = [("category", category)]
-            if sentence and sentence != category:
-                queries.append(("sentence", sentence))
+            if sentences:
+                sent = sentences[0]
+                if sent and sent != category:
+                    queries.append(("sentence", sent))
 
             for query_type, query_text in queries:
                 # CLIP 텍스트 인코딩 + activation 계산
@@ -228,7 +258,7 @@ def main():
                 metrics["category"] = category
                 metrics["query_type"] = query_type
                 metrics["query_text"] = query_text
-                metrics["sentence"] = sentence
+                metrics["sentences"] = sentences
                 metrics["scene"] = scene_name
 
                 all_results.append(metrics)
@@ -256,7 +286,7 @@ def main():
     # 결과 저장
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
 
     # 요약 출력
     if all_results:
@@ -277,7 +307,6 @@ def main():
         print(f"  Detection Rate:   {np.mean(detected)*100:.1f}%")
         print(f"{'='*60}")
 
-        # query_type별 결과
         from collections import defaultdict
         for qt in ["category", "sentence"]:
             qt_results = [r for r in all_results if r.get("query_type") == qt]

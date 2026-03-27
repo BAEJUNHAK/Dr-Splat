@@ -137,6 +137,57 @@ def render_sets(dataset : ModelParams, pipeline : PipelineParams, skip_train : b
         if not skip_test:
              render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
 
+def render_batch(dataset, pipeline, args, queries, clip_model, index, threshold=0.5, skip_train=True):
+    """배치 모드: 모델 1회 로드 후 여러 쿼리를 순차 처리 (render_activation.py를 반복 호출하지 않음)"""
+    import copy
+    with torch.no_grad():
+        gaussians = GaussianModel(dataset.sh_degree)
+        scene = Scene(dataset, gaussians, shuffle=False)
+
+        checkpoint = os.path.join(args.model_path, 'chkpnt0.pth')
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        gaussians.restore(model_params, args, mode='test')
+
+        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        gaussians_orig = copy.deepcopy(gaussians)
+
+        features = gaussians._language_feature.clone()
+        zero_mask = torch.all(features == -1, dim=-1)
+        leaf_lang_feat = torch.from_numpy(index.sa_decode(features[~zero_mask].cpu().numpy())).to("cuda")
+
+        views = scene.getTestCameras()
+        if not skip_train:
+            views = scene.getTrainCameras() + views
+
+        for query_text, save_label in tqdm(queries, desc="Batch queries"):
+            start_time = time.time()
+            clip_model.set_positives([query_text])
+
+            activation_features = torch.zeros((features.shape[0], 1), dtype=torch.float32).cuda()
+            _activation = clip_model.get_activation(leaf_lang_feat, 0)
+            activation_features[~zero_mask] = _activation
+
+            thr = threshold
+            activation_threshold = torch.where(activation_features.squeeze() > thr)[0]
+
+            # colormap용 Gaussian 색상 교체
+            features_colormap = colormaps.apply_colormap(activation_features, colormap_options=COLORMAP_OPTIONS)
+            features_colormap = (features_colormap.unsqueeze(1) - 0.5) / 0.28209479177387814
+            gaussians._features_dc.data.copy_(gaussians_orig._features_dc.data)
+            gaussians._features_rest.data.copy_(gaussians_orig._features_rest.data)
+            gaussians._features_dc[activation_threshold] = features_colormap[activation_threshold]
+            gaussians._features_rest[activation_threshold] = 0
+
+            elapsed = time.time() - start_time
+            print(f'  "{query_text}" activation: {elapsed:.2f}s')
+
+            render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter,
+                       views, gaussians, gaussians_orig, pipeline, background, args,
+                       0, clip_model, save_label, activation_features, thr)
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     
