@@ -169,14 +169,19 @@ def main():
         img_w = data["info"]["width"]
         img_h = data["info"]["height"]
 
-        # 카메라 뷰 찾기
+        # 카메라 뷰 찾기 (정확 매칭 → 숫자 매칭 → 서브스트링)
         cam = cam_dict.get(frame_name)
         if cam is None:
-            # frame_00060 → 다른 이름 형식으로 시도
-            for cam_name, cam_obj in cam_dict.items():
-                if frame_name in cam_name or cam_name in frame_name:
-                    cam = cam_obj
-                    break
+            # frame_00060에서 숫자 추출하여 매칭
+            import re
+            frame_nums = re.findall(r'\d+', frame_name)
+            frame_num = frame_nums[-1] if frame_nums else None
+            if frame_num:
+                for cam_name, cam_obj in cam_dict.items():
+                    cam_nums = re.findall(r'\d+', cam_name)
+                    if cam_nums and cam_nums[-1] == frame_num:
+                        cam = cam_obj
+                        break
         if cam is None:
             print(f"[WARN] Camera not found for {frame_name}, skipping")
             continue
