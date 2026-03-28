@@ -203,13 +203,21 @@ def main():
 
             # GT 마스크 로드 (PNG 파일 경로 or 폴리곤 좌표)
             if isinstance(segmentation, str) and segmentation:
-                # Ref-lerf 포맷: segmentation은 gt_mask/ 내 PNG 파일 경로
-                mask_path = os.path.join(ref_lerf_scene, segmentation)
-                if not os.path.exists(mask_path):
-                    # gt_mask/ 접두사 없이 시도
-                    mask_path = os.path.join(gt_mask_dir, os.path.basename(segmentation))
-                if not os.path.exists(mask_path):
-                    print(f"    [WARN] GT mask not found: {segmentation}, skipping")
+                # Ref-lerf 포맷: segmentation = "frame_00006/bowl.png" 등
+                # 여러 경로 후보 시도
+                candidates = [
+                    os.path.join(gt_mask_dir, segmentation),                    # gt_mask/frame_00006/bowl.png
+                    os.path.join(ref_lerf_scene, segmentation),                 # ramen/frame_00006/bowl.png
+                    os.path.join(ref_lerf_scene, "gt_mask", segmentation),      # ramen/gt_mask/frame_00006/bowl.png
+                    os.path.join(gt_mask_dir, os.path.basename(segmentation)),   # gt_mask/bowl.png
+                ]
+                mask_path = None
+                for c in candidates:
+                    if os.path.exists(c):
+                        mask_path = c
+                        break
+                if mask_path is None:
+                    print(f"    [WARN] GT mask not found: {segmentation}, tried: {candidates[0]}, skipping")
                     continue
                 gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                 if gt_mask_full is None:
