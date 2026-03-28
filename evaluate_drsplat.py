@@ -131,7 +131,10 @@ def main():
     scene_name = os.path.basename(dataset.source_path)
     ref_lerf_scene = os.path.join(args.ref_lerf_dir, scene_name)
     test_json_dir = os.path.join(ref_lerf_scene, "json", "test_json")
-    gt_mask_dir = os.path.join(ref_lerf_scene, "gt_mask")
+    # Ref-lerf 실제 폴더명은 "mask" (gt_mask 아님)
+    gt_mask_dir = os.path.join(ref_lerf_scene, "mask")
+    if not os.path.isdir(gt_mask_dir):
+        gt_mask_dir = os.path.join(ref_lerf_scene, "gt_mask")  # fallback
 
     if not os.path.isdir(test_json_dir):
         print(f"[ERROR] test_json dir not found: {test_json_dir}")
@@ -223,7 +226,7 @@ def main():
                 if gt_mask_full is None:
                     print(f"    [WARN] Failed to read mask: {mask_path}, skipping")
                     continue
-                gt_mask_full = (gt_mask_full > 127).astype(np.uint8)
+                gt_mask_full = (gt_mask_full > 0).astype(np.uint8)
             elif isinstance(segmentation, list) and len(segmentation) > 0:
                 # 이전 포맷: 폴리곤 좌표
                 img_w = data.get("info", {}).get("width", render_w)
