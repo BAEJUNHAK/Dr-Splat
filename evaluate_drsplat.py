@@ -49,6 +49,7 @@ def compute_metrics(pred_mask, gt_mask):
     recall = (intersection / gt_area * 100) if gt_area > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     detected = 1 if intersection > 0 else 0
+    acc_25 = 1 if iou > 25.0 else 0
     area_ratio = (gt_area / total_pixels * 100)
 
     return {
@@ -57,6 +58,7 @@ def compute_metrics(pred_mask, gt_mask):
         "recall": recall,
         "f1": f1,
         "detected": detected,
+        "acc_25": acc_25,
         "gt_area": int(gt_area),
         "pred_area": int(pred_area),
         "area_ratio": area_ratio,
@@ -101,6 +103,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--include_feature", action="store_true")
+    parser.add_argument("--custom_queries", type=str, default=None,
+                        help="Path to custom queries JSON. Format: [{\"query\": \"yellow bowl\", \"gt_category\": \"bowl\", \"level\": \"L1\"}, ...]")
 
     args = get_combined_args(parser)
 
@@ -294,6 +298,104 @@ def main():
                 metrics["gt_path"] = gt_path
                 metrics["overlay_path"] = overlay_path
 
+    # 커스텀 쿼리 평가 (--custom_queries)
+    if args.custom_queries and os.path.exists(args.custom_queries):
+        with open(args.custom_queries) as f:
+            custom_queries = json.load(f)
+        print(f"\n  Custom queries: {len(custom_queries)} from {args.custom_queries}")
+
+        # 프레임별 GT 마스크 캐시: {frame_name: {category: gt_mask}}
+        gt_cache = {}
+        for json_file in sorted(os.listdir(test_json_dir)):
+            if not json_file.endswith('.json'):
+                continue
+            frame_name = json_file.replace('.json', '')
+            with open(os.path.join(test_json_dir, json_file)) as f:
+                data = json.load(f)
+
+            cam = cam_dict.get(frame_name)
+            if cam is None:
+                frame_nums = re.findall(r'\d+', frame_name)
+                frame_num = frame_nums[-1] if frame_nums else None
+                if frame_num:
+                    for cam_name, cam_obj in cam_dict.items():
+                        cam_nums = re.findall(r'\d+', cam_name)
+                        if cam_nums and cam_nums[-1] == frame_num:
+                            cam = cam_obj
+                            break
+            if cam is None:
+                continue
+
+            with torch.no_grad():
+                orig_output = render(cam, gaussians, pipe, background, args)
+                render_h, render_w = orig_output["render"].shape[1], orig_output["render"].shape[2]
+
+            gt_cache[frame_name] = {"cam": cam, "masks": {}, "render_hw": (render_h, render_w)}
+            objects = data.get("object", data.get("objects", []))
+            for obj in objects:
+                category = obj.get("category", "unknown")
+                segmentation = obj.get("segmentation", "")
+                if isinstance(segmentation, str) and segmentation:
+                    candidates = [
+                        os.path.join(gt_mask_dir, segmentation),
+                        os.path.join(ref_lerf_scene, segmentation),
+                        os.path.join(ref_lerf_scene, "gt_mask", segmentation),
+                        os.path.join(gt_mask_dir, os.path.basename(segmentation)),
+                    ]
+                    mask_path = None
+                    for c in candidates:
+                        if os.path.exists(c):
+                            mask_path = c
+                            break
+                    if mask_path is None:
+                        continue
+                    gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if gt_mask_full is None:
+                        continue
+                    gt_mask_full = (gt_mask_full > 0).astype(np.uint8)
+                    gt_mask_resized = cv2.resize(gt_mask_full, (render_w, render_h), interpolation=cv2.INTER_NEAREST)
+                    gt_cache[frame_name]["masks"][category] = gt_mask_resized
+
+        for cq in tqdm(custom_queries, desc="Custom queries"):
+            query_text = cq["query"]
+            gt_category = cq["gt_category"]
+            level = cq.get("level", "custom")
+
+            clip_model.set_positives([query_text])
+            activation_features = torch.zeros((features.shape[0], 1), dtype=torch.float32).cuda()
+            with torch.no_grad():
+                _activation = clip_model.get_activation(leaf_lang_feat, 0)
+            activation_features[~zero_mask] = _activation
+
+            for frame_name, cache in gt_cache.items():
+                if gt_category not in cache["masks"]:
+                    continue
+                gt_mask = cache["masks"][gt_category]
+                cam = cache["cam"]
+
+                with torch.no_grad():
+                    pred_mask, rendered = render_activation_mask(
+                        gaussians, cam, activation_features, args.threshold,
+                        pipe, background, args
+                    )
+
+                metrics = compute_metrics(pred_mask, gt_mask)
+                metrics["frame"] = frame_name
+                metrics["category"] = gt_category
+                metrics["query_type"] = level
+                metrics["query_text"] = query_text
+                metrics["sentences"] = []
+                metrics["scene"] = scene_name
+
+                safe_label = query_text.replace(" ", "_")[:40]
+                safe_cat = gt_category.replace(" ", "_").replace("/", "_")
+                pred_path = os.path.join(output_dir, "pred_masks", f"{frame_name}_{safe_cat}_{safe_label}.png")
+                cv2.imwrite(pred_path, pred_mask * 255)
+                metrics["pred_path"] = pred_path
+                metrics["gt_path"] = os.path.join(output_dir, "gt_masks", f"{frame_name}_{safe_cat}.png")
+
+                all_results.append(metrics)
+
     # 결과 저장
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, 'w') as f:
@@ -301,41 +403,50 @@ def main():
 
     # 요약 출력
     if all_results:
+        from collections import defaultdict
+
         ious = [r["iou"] for r in all_results]
         precisions = [r["precision"] for r in all_results]
         recalls = [r["recall"] for r in all_results]
         f1s = [r["f1"] for r in all_results]
         detected = [r["detected"] for r in all_results]
+        acc_25s = [r["acc_25"] for r in all_results]
 
         print(f"\n{'='*60}")
         print(f"Dr. Splat Evaluation Results - {scene_name}")
         print(f"{'='*60}")
         print(f"  Total queries:    {len(all_results)}")
         print(f"  mIoU:             {np.mean(ious):.2f}%")
+        print(f"  mAcc@0.25:        {np.mean(acc_25s)*100:.2f}%")
         print(f"  Precision:        {np.mean(precisions):.2f}%")
         print(f"  Recall:           {np.mean(recalls):.2f}%")
         print(f"  F1:               {np.mean(f1s):.2f}%")
         print(f"  Detection Rate:   {np.mean(detected)*100:.1f}%")
         print(f"{'='*60}")
 
-        from collections import defaultdict
-        for qt in ["category", "sentence"]:
+        # 쿼리 타입별 출력 (category, sentence, L0, L1, L5, ...)
+        query_types = sorted(set(r.get("query_type", "") for r in all_results))
+        for qt in query_types:
             qt_results = [r for r in all_results if r.get("query_type") == qt]
             if not qt_results:
                 continue
             qt_ious = [r["iou"] for r in qt_results]
+            qt_acc25 = [r["acc_25"] for r in qt_results]
             print(f"\n--- Query Type: {qt} ---")
-            print(f"  mIoU: {np.mean(qt_ious):.2f}%  (n={len(qt_results)})")
+            print(f"  mIoU: {np.mean(qt_ious):.2f}%  mAcc@0.25: {np.mean(qt_acc25)*100:.2f}%  (n={len(qt_results)})")
 
             cat_results = defaultdict(list)
+            cat_acc25 = defaultdict(list)
             for r in qt_results:
                 cat_results[r["category"]].append(r["iou"])
+                cat_acc25[r["category"]].append(r["acc_25"])
 
-            print(f"\n  {'Category':<25s} {'mIoU':>8s} {'Count':>6s}")
-            print("  " + "-" * 43)
+            print(f"\n  {'Category':<25s} {'mIoU':>8s} {'Acc@.25':>8s} {'Count':>6s}")
+            print("  " + "-" * 51)
             for cat in sorted(cat_results.keys()):
                 ious_cat = cat_results[cat]
-                print(f"    {cat:<23s} {np.mean(ious_cat):>7.2f}% {len(ious_cat):>5d}")
+                acc_cat = cat_acc25[cat]
+                print(f"    {cat:<23s} {np.mean(ious_cat):>7.2f}% {np.mean(acc_cat)*100:>7.2f}% {len(ious_cat):>5d}")
 
     print(f"\nResults saved to: {results_path}")
 
