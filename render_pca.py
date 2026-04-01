@@ -55,6 +55,28 @@ def render_set(model_path, source_path, name, iteration, views, gaussians, pipel
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
     
                
+def select_views_by_frame_names(scene, frame_names):
+    """frame_names에 해당하는 카메라만 선택 (train+test 전체에서 매칭)"""
+    import re
+    all_cameras = scene.getTrainCameras() + scene.getTestCameras()
+    cam_dict = {}
+    for cam in all_cameras:
+        cam_dict[cam.image_name] = cam
+        nums = re.findall(r'\d+', cam.image_name)
+        if nums:
+            cam_dict[nums[-1]] = cam
+    views = []
+    for fn in frame_names:
+        if fn in cam_dict:
+            views.append(cam_dict[fn])
+        else:
+            nums = re.findall(r'\d+', fn)
+            if nums and nums[-1] in cam_dict:
+                views.append(cam_dict[nums[-1]])
+    print(f"  Selected {len(views)}/{len(frame_names)} cameras from frame_names")
+    return views
+
+
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, args, index):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
@@ -62,7 +84,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         checkpoint = os.path.join(args.model_path, 'chkpnt0.pth')
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, args, mode='test')
-        
+
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -78,16 +100,21 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         U, S, V = torch.pca_lowrank(clip_features, q=3)
         pca_rgb = torch.matmul(clip_features, V.cuda())
         pca_rgb = ((pca_rgb - torch.mean(pca_rgb, 0))) / (torch.std(pca_rgb,0)*5) + 0.5
-        
+
         gaussians._features_dc = (pca_rgb - 0.5) / 0.28209479177387814
         gaussians._features_dc = gaussians._features_dc.cuda().unsqueeze(1)
         gaussians._features_rest[:,:,:] = 0
 
-        if not skip_train:
-            render_set(dataset.model_path, dataset.source_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, args)
-
-        if not skip_test:
-             render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, args)
+        # --frame_names가 지정되면 해당 프레임만 렌더링
+        frame_names = getattr(args, 'frame_names', None)
+        if frame_names:
+            views = select_views_by_frame_names(scene, frame_names.split(','))
+            render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, views, gaussians, pipeline, background, args)
+        else:
+            if not skip_train:
+                render_set(dataset.model_path, dataset.source_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, args)
+            if not skip_test:
+                render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, args)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -101,6 +128,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--include_feature", action="store_true")
     parser.add_argument("--pq_index", type=str, default=None)
+    parser.add_argument("--frame_names", type=str, default=None,
+                        help="Comma-separated frame names to render (e.g., frame_00006,frame_00024)")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)

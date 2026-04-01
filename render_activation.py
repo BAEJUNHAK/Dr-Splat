@@ -131,11 +131,32 @@ def render_sets(dataset : ModelParams, pipeline : PipelineParams, skip_train : b
         end_time = time.time()
         print(f'Running time : {end_time - start_time}')
 
-        if not skip_train:
-             render_set(dataset.model_path, dataset.source_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
-
-        if not skip_test:
-             render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
+        # --frame_names가 지정되면 해당 프레임만 렌더링
+        frame_names = getattr(args, 'frame_names', None)
+        if frame_names:
+            import re
+            all_cameras = scene.getTrainCameras() + scene.getTestCameras()
+            cam_dict = {}
+            for cam in all_cameras:
+                cam_dict[cam.image_name] = cam
+                nums = re.findall(r'\d+', cam.image_name)
+                if nums:
+                    cam_dict[nums[-1]] = cam
+            views = []
+            for fn in frame_names.split(','):
+                if fn in cam_dict:
+                    views.append(cam_dict[fn])
+                else:
+                    nums = re.findall(r'\d+', fn)
+                    if nums and nums[-1] in cam_dict:
+                        views.append(cam_dict[nums[-1]])
+            print(f"  Selected {len(views)} cameras from frame_names")
+            render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, views, gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
+        else:
+            if not skip_train:
+                 render_set(dataset.model_path, dataset.source_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
+            if not skip_test:
+                 render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
 
 def render_batch(dataset, pipeline, args, queries, clip_model, index, threshold=0.5, skip_train=True, frame_names=None):
     """배치 모드: 모델 1회 로드 후 여러 쿼리를 순차 처리
@@ -231,6 +252,8 @@ if __name__ == "__main__":
     parser.add_argument("--img_save_label", type=str, default=None)
     parser.add_argument("--img_label", type=str, default=None)
     parser.add_argument("--threshold", type=float, default=0.0)
+    parser.add_argument("--frame_names", type=str, default=None,
+                        help="Comma-separated frame names to render (e.g., frame_00006,frame_00024)")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
