@@ -137,9 +137,14 @@ def render_sets(dataset : ModelParams, pipeline : PipelineParams, skip_train : b
         if not skip_test:
              render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, gaussians_orig, pipeline, background, args, label, clip_model, img_save_label, activation_features, thr)
 
-def render_batch(dataset, pipeline, args, queries, clip_model, index, threshold=0.5, skip_train=True):
-    """배치 모드: 모델 1회 로드 후 여러 쿼리를 순차 처리 (render_activation.py를 반복 호출하지 않음)"""
-    import copy
+def render_batch(dataset, pipeline, args, queries, clip_model, index, threshold=0.5, skip_train=True, frame_names=None):
+    """배치 모드: 모델 1회 로드 후 여러 쿼리를 순차 처리
+
+    Args:
+        frame_names: 렌더링할 프레임 이름 리스트 (e.g., ["frame_00006", ...]).
+                     None이면 기존 동작 (test cameras 사용).
+    """
+    import copy, re
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, shuffle=False)
@@ -157,9 +162,30 @@ def render_batch(dataset, pipeline, args, queries, clip_model, index, threshold=
         zero_mask = torch.all(features == -1, dim=-1)
         leaf_lang_feat = torch.from_numpy(index.sa_decode(features[~zero_mask].cpu().numpy())).to("cuda")
 
-        views = scene.getTestCameras()
-        if not skip_train:
-            views = scene.getTrainCameras() + views
+        if frame_names is not None:
+            # Ref-lerf 테스트 프레임에 해당하는 카메라만 선택
+            all_cameras = scene.getTrainCameras() + scene.getTestCameras()
+            cam_dict = {}
+            for cam in all_cameras:
+                cam_dict[cam.image_name] = cam
+                # 숫자 기반 fallback 매칭
+                nums = re.findall(r'\d+', cam.image_name)
+                if nums:
+                    cam_dict[nums[-1]] = cam
+
+            views = []
+            for fn in frame_names:
+                if fn in cam_dict:
+                    views.append(cam_dict[fn])
+                else:
+                    nums = re.findall(r'\d+', fn)
+                    if nums and nums[-1] in cam_dict:
+                        views.append(cam_dict[nums[-1]])
+            print(f"  Selected {len(views)}/{len(frame_names)} cameras from frame_names")
+        else:
+            views = scene.getTestCameras()
+            if not skip_train:
+                views = scene.getTrainCameras() + views
 
         for query_text, save_label in tqdm(queries, desc="Batch queries"):
             start_time = time.time()
